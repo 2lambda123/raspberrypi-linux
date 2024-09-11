@@ -261,6 +261,15 @@ static u32 axi_chan_get_xfer_width(struct axi_dma_chan *chan, dma_addr_t src,
 	return __ffs(src | dst | len | BIT(max_width));
 }
 
+static u32 axi_dma_encode_msize(u32 max_burst)
+{
+	if (max_burst <= 1)
+		return DWAXIDMAC_BURST_TRANS_LEN_1;
+	if (max_burst > 1024)
+		return DWAXIDMAC_BURST_TRANS_LEN_1024;
+	return fls(max_burst) - 2;
+}
+
 static inline const char *axi_chan_name(struct axi_dma_chan *chan)
 {
 	return dma_chan_name(&chan->vc.chan);
@@ -305,7 +314,7 @@ static struct axi_dma_lli *axi_desc_get(struct axi_dma_chan *chan,
 static void axi_desc_put(struct axi_dma_desc *desc)
 {
 	struct axi_dma_chan *chan = desc->chan;
-	u32 count = desc->hw_desc_count;
+	int count = desc->nr_hw_descs;
 	struct axi_dma_hw_desc *hw_desc;
 	int descs_put;
 
@@ -685,41 +694,41 @@ static int dw_axi_dma_set_hw_desc(struct axi_dma_chan *chan,
 	size_t axi_block_ts;
 	size_t block_ts;
 	u32 ctllo, ctlhi;
-	u32 burst_len;
+	u32 burst_len = 0, mem_burst_msize, reg_burst_msize;
 
 	axi_block_ts = chan->chip->dw->hdata->block_size[chan->id];
 
 	mem_width = __ffs(data_width | mem_addr | len);
-	if (mem_width > DWAXIDMAC_TRANS_WIDTH_32)
-		mem_width = DWAXIDMAC_TRANS_WIDTH_32;
 
 	if (!IS_ALIGNED(mem_addr, 4)) {
 		dev_err(chan->chip->dev, "invalid buffer alignment\n");
 		return -EINVAL;
 	}
 
+	/* Use a reasonable upper limit otherwise residue reporting granularity grows large */
+	mem_burst_msize = axi_dma_encode_msize(16);
+
 	switch (chan->direction) {
 	case DMA_MEM_TO_DEV:
+		reg_burst_msize = axi_dma_encode_msize(chan->config.dst_maxburst);
 		reg_width = __ffs(chan->config.dst_addr_width);
 		device_addr = phys_to_dma(chan->chip->dev, chan->config.dst_addr);
 		ctllo = reg_width << CH_CTL_L_DST_WIDTH_POS |
 			mem_width << CH_CTL_L_SRC_WIDTH_POS |
-			DWAXIDMAC_BURST_TRANS_LEN_1 << CH_CTL_L_DST_MSIZE_POS |
-			DWAXIDMAC_BURST_TRANS_LEN_4 << CH_CTL_L_SRC_MSIZE_POS |
+			reg_burst_msize << CH_CTL_L_DST_MSIZE_POS |
+			mem_burst_msize << CH_CTL_L_SRC_MSIZE_POS |
 			DWAXIDMAC_CH_CTL_L_NOINC << CH_CTL_L_DST_INC_POS |
 			DWAXIDMAC_CH_CTL_L_INC << CH_CTL_L_SRC_INC_POS;
 		block_ts = len >> mem_width;
 		break;
 	case DMA_DEV_TO_MEM:
+		reg_burst_msize = axi_dma_encode_msize(chan->config.src_maxburst);
 		reg_width = __ffs(chan->config.src_addr_width);
-		/* Prevent partial access units getting lost */
-		if (mem_width > reg_width)
-			mem_width = reg_width;
 		device_addr = phys_to_dma(chan->chip->dev, chan->config.src_addr);
 		ctllo = reg_width << CH_CTL_L_SRC_WIDTH_POS |
 			mem_width << CH_CTL_L_DST_WIDTH_POS |
-			DWAXIDMAC_BURST_TRANS_LEN_4 << CH_CTL_L_DST_MSIZE_POS |
-			DWAXIDMAC_BURST_TRANS_LEN_1 << CH_CTL_L_SRC_MSIZE_POS |
+			mem_burst_msize << CH_CTL_L_DST_MSIZE_POS |
+			reg_burst_msize << CH_CTL_L_SRC_MSIZE_POS |
 			DWAXIDMAC_CH_CTL_L_INC << CH_CTL_L_DST_INC_POS |
 			DWAXIDMAC_CH_CTL_L_NOINC << CH_CTL_L_SRC_INC_POS;
 		block_ts = len >> reg_width;
@@ -760,6 +769,12 @@ static int dw_axi_dma_set_hw_desc(struct axi_dma_chan *chan,
 	set_desc_src_master(hw_desc);
 
 	hw_desc->len = len;
+
+	if (burst_len && (chan->config.src_maxburst > burst_len))
+		dev_warn_ratelimited(chan2dev(chan),
+				     "%s: requested source burst length %u exceeds supported burst length %u - data may be lost\n",
+				     axi_chan_name(chan), chan->config.src_maxburst, burst_len);
+
 	return 0;
 }
 
@@ -776,9 +791,6 @@ static size_t calculate_block_len(struct axi_dma_chan *chan,
 	case DMA_MEM_TO_DEV:
 		data_width = BIT(chan->chip->dw->hdata->m_data_width);
 		mem_width = __ffs(data_width | dma_addr | buf_len);
-		if (mem_width > DWAXIDMAC_TRANS_WIDTH_32)
-			mem_width = DWAXIDMAC_TRANS_WIDTH_32;
-
 		block_len = axi_block_ts << mem_width;
 		break;
 	case DMA_DEV_TO_MEM:
@@ -849,7 +861,7 @@ dw_axi_dma_chan_prep_cyclic(struct dma_chan *dchan, dma_addr_t dma_addr,
 		src_addr += segment_len;
 	}
 
-	desc->hw_desc_count = total_segments;
+	desc->nr_hw_descs = total_segments;
 
 	llp = desc->hw_desc[0].llp;
 
@@ -933,7 +945,7 @@ dw_axi_dma_chan_prep_slave_sg(struct dma_chan *dchan, struct scatterlist *sgl,
 		} while (len >= segment_len);
 	}
 
-	desc->hw_desc_count = loop;
+	desc->nr_hw_descs = loop;
 
 	/* Set end-of-link to the last link descriptor of list */
 	set_desc_last(&desc->hw_desc[num_sgs - 1]);
@@ -1042,7 +1054,7 @@ dma_chan_prep_dma_memcpy(struct dma_chan *dchan, dma_addr_t dst_adr,
 		num++;
 	}
 
-	desc->hw_desc_count = num;
+	desc->nr_hw_descs = num;
 
 	/* Set end-of-link to the last link descriptor of list */
 	set_desc_last(&desc->hw_desc[num - 1]);
@@ -1092,7 +1104,7 @@ static void axi_chan_dump_lli(struct axi_dma_chan *chan,
 static void axi_chan_list_dump_lli(struct axi_dma_chan *chan,
 				   struct axi_dma_desc *desc_head)
 {
-	u32 count = desc_head->hw_desc_count;
+	int count = desc_head->nr_hw_descs;
 	int i;
 
 	for (i = 0; i < count; i++)
@@ -1139,7 +1151,7 @@ static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 	struct axi_dma_desc *desc;
 	struct virt_dma_desc *vd;
 	unsigned long flags;
-	u32 count;
+	int count;
 	u64 llp;
 	int i;
 
@@ -1161,7 +1173,7 @@ static void axi_chan_block_xfer_complete(struct axi_dma_chan *chan)
 	if (chan->cyclic) {
 		desc = vd_to_axi_desc(vd);
 		if (desc) {
-			count = desc->hw_desc_count;
+			count = desc->nr_hw_descs;
 			llp = lo_hi_readq(chan->chan_regs + CH_LLP);
 			for (i = 0; i < count; i++) {
 				hw_desc = &desc->hw_desc[i];
@@ -1470,6 +1482,7 @@ static int dw_probe(struct platform_device *pdev)
 	struct dw_axi_dma *dw;
 	struct dw_axi_dma_hcfg *hdata;
 	struct reset_control *resets;
+	unsigned int max_seg_size;
 	unsigned int flags;
 	u32 i;
 	int ret;
@@ -1585,9 +1598,21 @@ static int dw_probe(struct platform_device *pdev)
 	 * Synopsis DesignWare AxiDMA datasheet mentioned Maximum
 	 * supported blocks is 1024. Device register width is 4 bytes.
 	 * Therefore, set constraint to 1024 * 4.
+	 * However, if all channels specify a greater value, use that instead.
 	 */
+
 	dw->dma.dev->dma_parms = &dw->dma_parms;
-	dma_set_max_seg_size(&pdev->dev, MAX_BLOCK_SIZE);
+	max_seg_size = UINT_MAX;
+	for (i = 0; i < dw->hdata->nr_channels; i++) {
+		unsigned int block_size = chip->dw->hdata->block_size[i];
+
+		if (!block_size)
+			block_size = MAX_BLOCK_SIZE;
+		max_seg_size = min(block_size, max_seg_size);
+	}
+
+	dma_set_max_seg_size(&pdev->dev, max_seg_size);
+
 	platform_set_drvdata(pdev, chip);
 
 	pm_runtime_enable(chip->dev);

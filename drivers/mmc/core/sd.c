@@ -1104,6 +1104,15 @@ static int sd_parse_ext_reg_perf(struct mmc_card *card, u8 fno, u8 page,
 		pr_debug("%s: Command Queue supported depth %u\n",
 			 mmc_hostname(card->host),
 			 card->ext_csd.cmdq_depth);
+		/*
+		 * If CQ is enabled, there is a contract between host and card such that
+		 * VDD will be maintained and removed only if a power off notification
+		 * is provided. An SD card in an accessible slot means surprise removal
+		 * is a possibility. As a middle ground, keep the default maximum of 1
+		 * posted write unless the card is "hardwired".
+		 */
+		if (!mmc_card_is_removable(card->host))
+			card->max_posted_writes = card->ext_csd.cmdq_depth;
 	}
 
 	card->ext_perf.fno = fno;
@@ -1265,6 +1274,14 @@ static int sd_flush_cache(struct mmc_host *host)
 	reg_buf = card->ext_reg_buf;
 
 	/*
+	 * Flushing requires sending CMD49 (adtc), which can't be done as a DCMD
+	 * and conflicts with CQHCI - temporarily turn CQE off to use the SDHCI
+	 * command/argument registers.
+	 */
+	if (host->cqe_on)
+		host->cqe_ops->cqe_off(host);
+
+	/*
 	 * Set Flush Cache at bit 0 in the performance enhancement register at
 	 * 261 bytes offset.
 	 */
@@ -1367,6 +1384,7 @@ retry:
 
 		card->ocr = ocr;
 		card->type = MMC_TYPE_SD;
+		card->max_posted_writes = 1;
 		memcpy(card->raw_cid, cid, sizeof(card->raw_cid));
 	}
 
