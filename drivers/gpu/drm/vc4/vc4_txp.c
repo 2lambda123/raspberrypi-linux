@@ -259,10 +259,13 @@ static int vc4_txp_connector_atomic_check(struct drm_connector *conn,
 	crtc_state = drm_atomic_get_new_crtc_state(state, conn_state->crtc);
 
 	fb = conn_state->writeback_job->fb;
-	if (fb->width != crtc_state->mode.hdisplay ||
-	    fb->height != crtc_state->mode.vdisplay) {
-		DRM_DEBUG_KMS("Invalid framebuffer size %ux%u\n",
-			      fb->width, fb->height);
+	if ((fb->width != crtc_state->mode.hdisplay &&
+	     fb->width != crtc_state->mode.vdisplay) ||
+	    (fb->height != crtc_state->mode.vdisplay &&
+	     fb->height != crtc_state->mode.hdisplay)) {
+		DRM_DEBUG_KMS("Invalid framebuffer size %ux%u vs mode %ux%u\n",
+			      fb->width, fb->height,
+			      crtc_state->mode.hdisplay, crtc_state->mode.vdisplay);
 		return -EINVAL;
 	}
 
@@ -329,6 +332,9 @@ static void vc4_txp_connector_atomic_commit(struct drm_connector *conn,
 		 * hardware will force the output padding to be 0xff.
 		 */
 		ctrl |= TXP_ALPHA_INVERT;
+
+	if (fb->width != mode->hdisplay)
+		ctrl |= TXP_TRANSPOSE;
 
 	if (!drm_dev_enter(drm, &idx))
 		return;
